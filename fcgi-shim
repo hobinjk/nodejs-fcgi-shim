@@ -1,0 +1,284 @@
+#!/usr/bin/env ruby
+require 'logger'
+require 'optparse'
+require 'socket'
+require 'timeout'
+require 'rubygems'
+require 'fcgi'
+require 'curb'
+require 'thread'
+
+$log = Logger.new(STDERR)
+$log.level = Logger::INFO
+
+module FCGIShim
+  class Runner
+    # TODO: install sigchld handler?
+    def initialize(command)
+      @command = command
+      @mutex = Mutex.new
+      s = TCPServer.new(0)
+      a, port, b, c = s.addr
+      s.close
+      @port = port
+      $log.info("putting the thing on port #{@port.to_s}");      
+
+      spinup
+      register_sigchild_handler
+      register_at_exit
+    end
+
+    def spinup
+      @child = fork do
+        command_name, args = substituted_command
+        $log.info("Spinning up a #{command_name}")
+        $log.debug("Subprocess args are #{args.inspect} (original: #{@command.inspect})")
+        exec([command_name, command_name], *args)
+      end
+    end
+
+    def substituted_command
+      command_name = @command[0]
+      args = @command[1..-1]
+
+      count = 0
+      args = args.map do |arg|
+        arg.gsub('[fcgi-shim-port]') do
+          count += 1
+          @port.to_s
+        end
+      end
+
+      if count == 0
+        args += [@port.to_s]
+      elsif count > 1
+        raise "Too many [fcgi-shim-port]s: #{@command.inspect}"
+      end
+
+      [command_name, args]
+    end
+
+    def register_sigchild_handler
+      Signal.trap("CHLD") do
+        $log.error("Child on port #{@port.to_s} just died! Exiting.")
+        exit(0)
+      end
+    end
+
+    def register_at_exit
+      at_exit do
+        Signal.trap("CHLD", nil)
+        #begin
+        #  $log.info("Unlinking socket at #{@sockpath}.")
+        #  File.unlink(@sockpath)
+        #rescue Errno::ENOENT
+        #  $log.error("There was no socket at #{@sockpath}.")
+        #end
+
+        if @child
+          begin
+            Process.kill('TERM', @child)
+          rescue Errno::ESRCH
+            $log.error("Child process #{@child} on port #{@port} is already dead")
+          else
+            $log.info("Successfully killed child process #{@child} on port #{@port}")
+          end
+
+          # TODO: do a wait instead of sleeping?
+          sleep(0.5)
+
+          begin
+            Process.kill('KILL', @child)
+          rescue Errno::ESRCH
+          else
+            $log.error("TERM hadn't worked, so ended up KILLing #{@child} on port #{@port}")
+          end
+        end
+      end
+    end
+
+    def extract_headers(request)
+      http_headers = request.env.select do |key, value|
+        key.start_with?('HTTP_') ||
+          key == 'CONTENT_LENGTH' ||
+          key == 'CONTENT_TYPE'
+      end
+
+      headers = http_headers.map do |key, value|
+        key = $1 if key =~ /^HTTP_(.*)$/
+        key = key.split('_').map {|component| component.capitalize}.join('-')
+        key+": "+value #i.e. HTTP_ACCEPT_LANGUAGE => Accept-Language
+      end
+
+      headers
+    end
+    def create_curl(request)
+        method = request.env["REQUEST_METHOD"]
+        debug = method == "POST"
+        if debug
+            $log.info("creating curl for http://127.0.0.1:#{@port.to_s}#{request.env["REQUEST_URI"]}\n")
+        end
+        c = Curl::Easy.new("http://127.0.0.1:#{@port.to_s}#{request.env["REQUEST_URI"]}")
+        c.headers = extract_headers(request)
+        if method == "POST"
+            c.post_body = ""
+            until request.in.eof?
+                c.post_body += request.in.read(4096)
+            end
+        end
+        #c.follow_location = true #lazylazylazy
+        if debug
+            $log.info(c.headers)
+        end
+        
+        40.times do |i| #curb hides connrefuseds under a weird timeout that is way too long 
+            begin
+                s = TCPSocket.new("127.0.0.1", @port)
+            rescue Errno::ENOENT
+                $log.debug("no sock yet, waiting")
+                sleep(0.1)
+            rescue Errno::ECONNREFUSED
+                $log.debug("nothing listening yet")
+                sleep(0.1)
+            else
+                s.close
+                break
+            end
+        end
+        10.times do |i|
+            begin
+                if debug
+                    $log.info("http #{method} go!\n");
+                end
+                c.http(method)
+                resp_headers = c.header_str.split(/\r\n/)
+                resp_headers.sort! { |a, b|
+                    ai = 2
+                    if a.start_with? "HTTP"
+                        ai = 1
+                    elsif a.start_with? "Content-Type"
+                        ai = 0
+                    end
+                    bi = 2
+                    if b.start_with? "HTTP"
+                        bi = 1
+                    elsif b.start_with? "Content-Type"
+                        bi = 0
+                    end
+                    ai <=> bi
+                }
+                #resp_headers[0] = "Content-Type: text/plain"
+                #resp_headers = resp_headers[0..2]
+                resp_headers.each_with_index {|line,idx|
+                    if line.start_with? "Transfer-Encoding"
+                        next #6172536699
+                    end
+                    if idx == 0 and not line.start_with? "Content-Type"
+                        request.out.print("Content-Type: text/html\r\n");
+                    end
+                    
+                    if debug
+                        $log.info("line: "+line)
+                    end
+                    if line =~ %r{^HTTP/[0-9.]+ (\d+.*)$}m
+                        if debug
+                            $log.info("Status: #{$1}")
+                        end
+                        request.out.print("Status: #{$1}\r\n")
+                    else
+                        request.out.print(line+"\r\n");
+                    end
+                }
+                 
+                request.out.print("Content-Length: "+c.body_str.length.to_s+"\r\n\r\n")
+                request.out.print(c.body_str)
+                if debug
+                    $log.info("bod: "+c.body_str)
+                end
+                request.finish
+                return
+            rescue Curl::Err::ConnectionFailedError
+                $log.info("Nothing yet; waiting (try #{i})")
+                sleep(0.1)
+            end
+        end
+        raise "curb failed"
+    end
+
+    def construct_headers(request)
+      headers = extract_headers(request)
+      headers.map {|header, value| "#{header}: #{value}"}
+    end
+
+    def transform_status_code(chunk)
+      if chunk =~ %r{^HTTP/[0-9.]+ (\d+.*)$}m
+        "Status: #{$1}"
+      else
+        raise "Could not parse out status code: #{chunk.inspect}"
+      end
+    end
+
+    def run
+      FCGI.each {|request|
+        # p request.env
+        
+        create_curl(request)
+        # p construct_http_line(request)
+        # p construct_headers(request)
+
+        #    create_curl(request)
+        #}
+        # Write data to sock
+        # emit_request('request', upstream, http_line, headers, input)
+
+        #chunk_count = 0
+        # Read data from sock
+        # stream(upstream) do |chunk|
+          # Huge hack because CGI is lame
+          # chunk = transform_status_code(chunk) if chunk_count == 0
+          # chunk_count += 1
+          # emit('reply', output, chunk)
+        # end
+        # All done
+        # upstream.close
+
+      }
+    end
+  end
+end
+
+def main
+  options = {}
+  optparse = OptionParser.new do |opts|
+    opts.banner = "Usage: #{$0} [options] command [args]"
+
+    opts.on('-v', '--verbosity', 'Verbosity of debugging output') do
+      $log.level = Logger::DEBUG
+    end
+
+    opts.on('-h', '--help', 'Display this message') do
+      puts opts
+      exit(1)
+    end
+  end
+  optparse.parse!
+
+  if ARGV.length < 1
+    puts optparse
+    return 1
+  end
+
+  command = ARGV
+  runner = FCGIShim::Runner.new(command)
+  runner.run
+  return 0
+end
+
+if $0 == __FILE__
+  ret = main
+  begin
+    exit(ret)
+  rescue TypeError
+    exit(0)
+  end
+end
