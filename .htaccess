@@ -1,0 +1,5 @@
+AddDefaultCharset utf-8
+#RewriteBase /~hobinjk/wizard/srv/nodejs/
+RewriteEngine On
+RewriteRule ^(.*)$ dispatch.fcgi [QSA,L]
+
